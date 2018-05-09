@@ -39,6 +39,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -465,6 +466,182 @@ public class LinkDiscoveryManager implements IOFMessageListener,
         return po;
     }
 
+    //*********************
+    // Annanay 
+    //*********************
+    public OFPacketOut generateLLDPMessageMITM(long sw, short port,
+                                       boolean isStandard, boolean isReverse) {
+    	//Evaluation point: the beginning of LLDP Construct function
+    	time1 = System.nanoTime();
+    	
+        IOFSwitch iofSwitch = floodlightProvider.getSwitch(sw);
+        ImmutablePort ofpPort = iofSwitch.getPort(port);
+
+        if (log.isTraceEnabled()) {
+            log.trace("Sending LLDP packet out of swich: {}, port: {}",
+                      HexString.toHexString(sw), port);
+        }
+
+        // using "nearest customer bridge" MAC address for broadest possible
+        // propagation
+        // through provider and TPMR bridges (see IEEE 802.1AB-2009 and
+        // 802.1Q-2011),
+        // in particular the Linux bridge which behaves mostly like a provider
+        // bridge
+        byte[] chassisId = new byte[] { 4, 0, 0, 0, 0, 0, 0 }; // filled in
+                                                               // later
+        byte[] portId = new byte[] { 2, 0, 0 }; // filled in later
+        byte[] ttlValue = new byte[] { 0, 0x78 };
+        // OpenFlow OUI - 00-26-E1
+        byte[] dpidTLVValue = new byte[] { 0x0, 0x26, (byte) 0xe1, 0, 0, 0,
+                                          0, 0, 0, 0, 0, 0 };
+        LLDPTLV dpidTLV = new LLDPTLV().setType((byte) 127)
+                                       .setLength((short) dpidTLVValue.length)
+                                       .setValue(dpidTLVValue);
+
+        byte[] dpidArray = new byte[8];
+        ByteBuffer dpidBB = ByteBuffer.wrap(dpidArray);
+        ByteBuffer portBB = ByteBuffer.wrap(portId, 1, 2);
+
+        Long dpid = sw;
+        dpidBB.putLong(dpid);
+        // set the chassis id's value to last 6 bytes of dpid
+        System.arraycopy(dpidArray, 2, chassisId, 1, 6);
+        // set the optional tlv to the full dpid
+        System.arraycopy(dpidArray, 0, dpidTLVValue, 4, 8);
+
+        // TODO: Consider remove this block of code.
+        // It's evil to overwrite port object. The the old code always
+        // overwrote mac address, we now only overwrite zero macs and
+        // log a warning, mostly for paranoia.
+        byte[] srcMac = ofpPort.getHardwareAddress();
+        byte[] zeroMac = { 0, 0, 0, 0, 0, 0 };
+        if (Arrays.equals(srcMac, zeroMac)) {
+            log.warn("Port {}/{} has zero hareware address"
+                             + "overwrite with lower 6 bytes of dpid",
+                     HexString.toHexString(dpid), ofpPort.getPortNumber());
+            System.arraycopy(dpidArray, 2, srcMac, 0, 6);
+        }
+
+        // set the portId to the outgoing port
+        portBB.putShort(port);
+        if (log.isTraceEnabled()) {
+            log.trace("Sending LLDP out of interface: {}/{}",
+                      HexString.toHexString(sw), port);
+        }
+
+        LLDP lldp = new LLDP();
+        lldp.setChassisId(new LLDPTLV().setType((byte) 1)
+                                       .setLength((short) chassisId.length)
+                                       .setValue(chassisId));
+        lldp.setPortId(new LLDPTLV().setType((byte) 2)
+                                    .setLength((short) portId.length)
+                                    .setValue(portId));
+        lldp.setTtl(new LLDPTLV().setType((byte) 3)
+                                 .setLength((short) ttlValue.length)
+                                 .setValue(ttlValue));
+
+        lldp.getOptionalTLVList().add(dpidTLV);
+
+        // Add the controller identifier to the TLV value.
+        lldp.getOptionalTLVList().add(controllerTLV);
+        if (isReverse) {
+            lldp.getOptionalTLVList().add(reverseTLV);
+        } else {
+            lldp.getOptionalTLVList().add(forwardTLV);
+        }
+        
+        //evaluation point:the begin of adding MAC TLV
+        time2 = System.nanoTime();
+        
+        //TopoSec Extension
+        byte[] macTLVVaule = generateMACTLVValue(dpid, (Short)port);
+  
+        LLDPTLV macTLV = generateMACTLV(macTLVVaule);
+        //add Message Authentication Code TLV
+        lldp.getOptionalTLVList().add(macTLV);
+
+        //evalution point: the end of adding MAC TLV
+        time3 = System.nanoTime();
+        
+	// Annanay
+        byte[] filler = new byte[150];
+        new Random().nextBytes(filler);
+        lldp.getOptionalTLVList().add(new LLDPTLV().setType((byte) 0x1a)
+                                                   .setLength((short) filler.length)
+                                                   .setValue(filler));
+
+        time4 = System.nanoTime();
+	log.info("[generateLLDPMessageMITM] Sending LLDP packet, TLV list: " + lldp.getOptionalTLVList().toString() + " at " + time4.toString());
+
+        Ethernet ethernet;
+        if (isStandard) {
+            ethernet = new Ethernet().setSourceMACAddress(ofpPort.getHardwareAddress())
+                                     .setDestinationMACAddress(LLDP_STANDARD_DST_MAC_STRING)
+                                     .setEtherType(Ethernet.TYPE_LLDP);
+            ethernet.setPayload(lldp);
+        } else {
+            BSN bsn = new BSN(BSN.BSN_TYPE_BDDP);
+            bsn.setPayload(lldp);
+
+            ethernet = new Ethernet().setSourceMACAddress(ofpPort.getHardwareAddress())
+                                     .setDestinationMACAddress(LLDP_BSN_DST_MAC_STRING)
+                                     .setEtherType(Ethernet.TYPE_BSN);
+            ethernet.setPayload(bsn);
+        }
+
+        // serialize and wrap in a packet out
+        byte[] data = ethernet.serialize();
+        OFPacketOut po = (OFPacketOut) floodlightProvider.getOFMessageFactory()
+                                                         .getMessage(OFType.PACKET_OUT);
+        po.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+        po.setInPort(OFPort.OFPP_NONE);
+
+        // set data and data length
+        po.setLengthU(OFPacketOut.MINIMUM_LENGTH + data.length);
+        po.setPacketData(data);
+/*
+        //evaluation point: the end of LLDP Construct function
+        time4 = System.nanoTime();
+        
+        String str = time1.toString() + ','
+        								+ time2.toString() + ','
+        								+ time3.toString() + ','
+        								+ time4.toString();
+      
+        //evaluation: write the time to file
+        File f = new File("/mnt/hgfs/share_folder/evaluation/time_overhead_lldp_construction.csv");
+        Writer fileWriter = null;
+        BufferedWriter bufferedWriter = null;
+        if(f.exists() && !f.isDirectory()){
+        	try {
+				fileWriter = new FileWriter(f,true);
+				bufferedWriter = new BufferedWriter(fileWriter);
+				
+				bufferedWriter.write(str + System.getProperty("line.separator"));
+
+			} 
+        	catch (IOException e) {
+				
+				log.error("Error writing file: {}",e.getMessage());
+			}
+        	finally{
+        		if (bufferedWriter != null && fileWriter != null) {
+        			try{
+        				bufferedWriter.close();
+        				fileWriter.close();
+        			}
+        			catch (IOException e){
+        				log.error("Error closing file: {}",e.getMessage());
+        			}
+        		}
+
+        	}
+        }
+  */    
+        return po;
+    }
+
     /**
      * Get the LLDP sending period in seconds.
      *
@@ -652,6 +829,7 @@ public class LinkDiscoveryManager implements IOFMessageListener,
                 return Command.CONTINUE;
             return handleLldp((LLDP) bsn.getPayload(), sw, pi.getInPort(), false, cntx);
         } else if (eth.getPayload() instanceof LLDP) {
+			// Annanay. 
         	return handleLldp((LLDP) eth.getPayload(), sw, pi.getInPort(), true, cntx);
         /*
         	// evaluation
@@ -747,6 +925,8 @@ public class LinkDiscoveryManager implements IOFMessageListener,
     
     private Command handleLldp(LLDP lldp, long sw, short inPort,
                                boolean isStandard, FloodlightContext cntx) {
+	time5 = System.nanoTime();
+	log.info("[handleLldp] LLDP packet received: " + lldp.getOptionalTLVList().toString() + " at " + time5.toString());
     	//evaluation: in case the code does not reach time6 and time7
     	time6 = (long) 0;
     	time7 = (long) 0;
@@ -806,7 +986,7 @@ public class LinkDiscoveryManager implements IOFMessageListener,
         time6 = System.nanoTime();
         //TopoSec Extension: verify the MAC for message
         if(macTLV == null){
-        	log.error("Violation: receive a falsified LLDP: {}",lldp.toString());
+        	log.error("[1] Violation: receive a falsified LLDP: {}",lldp.toString());
         	return Command.STOP;
         }
         Long remoteDpid = remoteSwitch.getId();
@@ -815,7 +995,7 @@ public class LinkDiscoveryManager implements IOFMessageListener,
         }
         byte[] macTLVValue = macMap.get(remoteDpid).get(remotePort);
         if (!Arrays.equals(macTLVValue, macTLV.getValue())){
-        	log.warn("Violation: receive a falsified LLDP: {}",lldp.toString());
+        	log.warn("[2] Violation: receive a falsified LLDP: {}",lldp.toString());
         	return Command.STOP;
         }
         //evaluation point
@@ -1455,6 +1635,97 @@ public class LinkDiscoveryManager implements IOFMessageListener,
         return linkChanged;
     }
 
+    /**
+     * Send link discovery message out of a given switch port. 
+     * This particular function is for the discovery of a MITM.
+     *
+     * @param sw
+     * @param port
+     * @param isStandard
+     *            indicates standard or modified LLDP
+     * @param isReverse
+     *            indicates whether the LLDP was sent as a response
+     */
+    @LogMessageDoc(level = "ERROR",
+                   message = "Failure sending LLDP out port {port} on switch {switch}",
+                   explanation = "An I/O error occured while sending LLDP message "
+                                 + "to the switch.",
+                   recommendation = LogMessageDoc.CHECK_SWITCH)
+    protected void sendDiscoveryMessageMITM(long sw, short port,
+                                        boolean isStandard, boolean isReverse) {
+
+        // Takes care of all checks including null pointer checks.
+        if (!isOutgoingDiscoveryAllowed(sw, port, isStandard, isReverse))
+            return;
+
+        IOFSwitch iofSwitch = floodlightProvider.getSwitch(sw);
+        OFPhysicalPort ofpPort = iofSwitch.getPort(port).toOFPhysicalPort();
+
+        if (log.isTraceEnabled()) {
+            log.trace("Sending LLDP packet out of swich: {}, port: {}",
+                      HexString.toHexString(sw), port);
+        }
+        OFPacketOut po = generateLLDPMessageMITM(sw, port, isStandard, isReverse);
+
+        // Add actions
+        List<OFAction> actions = getDiscoveryActions(iofSwitch, ofpPort);
+        po.setActions(actions);
+        short  actionLength = 0;
+        Iterator <OFAction> actionIter = actions.iterator();
+        while (actionIter.hasNext()) {
+            actionLength += actionIter.next().getLength();
+        }
+        po.setActionsLength(actionLength);
+
+        // po already has the minimum length + data length set
+        // simply add the actions length to this.
+        po.setLengthU(po.getLengthU() + po.getActionsLength());
+
+        // send
+        try {
+            iofSwitch.write(po, null);
+            iofSwitch.flush();
+        } catch (IOException e) {
+            log.error("Failure sending LLDP out port {} on switch {}",
+                      new Object[] { port, iofSwitch.getStringId() }, e);
+        }
+    }
+
+    protected boolean isMITM(Link lt, LinkInfo newInfo) {
+		log.info("[isMITM] Link was detected between: " + lt.toString());
+
+        floodlightProvider.addOFMessageListener(OFType.PACKET_IN, this);
+		sendDiscoveryMessageMITM(lt.getSrc(), lt.getSrcPort(), false, false);
+		log.info("Sent a packet to switch: {}, port: {}", lt.getSrc(), lt.getSrcPort());
+
+		/*
+        for (long sw : floodlightProvider.getAllSwitchDpids()) {
+            IOFSwitch iofSwitch = floodlightProvider.getSwitch(sw);
+            if (iofSwitch == null) continue;
+            if (iofSwitch.getEnabledPorts() != null) {
+                for (ImmutablePort ofp : iofSwitch.getEnabledPorts()) {
+                    if (isLinkDiscoverySuppressed(sw, ofp.getPortNumber()))
+                                                                           continue;
+                    if (autoPortFastFeature
+                        && iofSwitch.isFastPort(ofp.getPortNumber()))
+                                                                     continue;
+
+                    // sends forward LLDP only non-fastports.
+                    sendDiscoveryMessage(sw, ofp.getPortNumber(), true,
+                                         false);
+
+				}
+			}
+		}
+		ethernet = new Ethernet().setSourceMACAddress(ofpPort.getHardwareAddress())
+								 .setDestinationMACAddress(LLDP_STANDARD_DST_MAC_STRING)
+								 .setEtherType(Ethernet.TYPE_LLDP);
+		ethernet.setPayload(lldp);
+		*/
+
+		return false;
+	}
+
     @LogMessageDocs({
         @LogMessageDoc(message="Inter-switch link detected:",
                 explanation="Detected a new link between two openflow switches," +
@@ -1494,9 +1765,11 @@ public class LinkDiscoveryManager implements IOFMessageListener,
                 // Add all to event history
                 LinkType linkType = getLinkType(lt, newInfo);
                 if (linkType == ILinkDiscovery.LinkType.DIRECT_LINK) {
-                    log.info("Inter-switch link detected: {}", lt);
-                    evDirectLink.updateEventNoFlush(new DirectLinkEvent(lt.getSrc(),
-                         lt.getSrcPort(), lt.getDst(), lt.getDstPort(), "direct-link-added::rcvd LLDP"));
+					if(!isMITM(lt, newInfo)){
+						log.info("Inter-switch link detected: {}", lt);
+						evDirectLink.updateEventNoFlush(new DirectLinkEvent(lt.getSrc(),
+							lt.getSrcPort(), lt.getDst(), lt.getDstPort(), "direct-link-added::rcvd LLDP"));
+					}
                 }
                 notifier.postNotification("Link added: " + lt.toString());
             } else {
@@ -1505,10 +1778,12 @@ public class LinkDiscoveryManager implements IOFMessageListener,
                     updateOperation = UpdateOperation.LINK_UPDATED;
                     LinkType linkType = getLinkType(lt, newInfo);
                     if (linkType == ILinkDiscovery.LinkType.DIRECT_LINK) {
-                        log.info("Inter-switch link updated: {}", lt);
-                        evDirectLink.updateEventNoFlush(new DirectLinkEvent(lt.getSrc(),
-                            lt.getSrcPort(), lt.getDst(), lt.getDstPort(),
-                            "link-port-state-updated::rcvd LLDP"));
+						if(!isMITM(lt, newInfo)){
+							log.info("Inter-switch link updated: {}", lt);
+							evDirectLink.updateEventNoFlush(new DirectLinkEvent(lt.getSrc(),
+								lt.getSrcPort(), lt.getDst(), lt.getDstPort(),
+								"link-port-state-updated::rcvd LLDP"));
+						}
                     }
                     notifier.postNotification("Link updated: " + lt.toString());
                 }
